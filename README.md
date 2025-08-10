@@ -1,3 +1,2 @@
 # Einstein-P
-einstein-picasso odyssey
 2025년 아인슈타인-피카소 오디세이 코드
