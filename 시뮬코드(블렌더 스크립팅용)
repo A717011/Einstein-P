@@ -1,0 +1,215 @@
+# ==========================================
+# GREC One-shot Simulation (No bpy.ops physics) - Blender 4.x OK
+# Visible rails & pulley, numeric physics, animation keyframes, CSV auto-save
+# ==========================================
+import bpy, bmesh, math, os
+
+# -------- User Params --------
+MASS_KG        = 500.0
+START_HEIGHT_M = 15.0
+LOAD_SIZE_M    = (1.0, 1.0, 1.0)
+
+# Visual
+RAIL_OFFSET_X  = 0.6
+RAIL_THICK     = 0.08
+RAIL_TOP_Z     = START_HEIGHT_M + 1.0
+WHEEL_R        = 0.40
+WHEEL_W        = 0.20
+WHEEL_Z        = START_HEIGHT_M + 0.20
+FLOOR_Z        = 0.0
+
+# Energy / brake
+ETA_MECH       = 0.75
+ETA_GEN        = 0.90
+ETA_TOTAL      = ETA_MECH * ETA_GEN
+C_DAMP         = 4000.0
+P_MAX_W        = 25000.0
+G              = 9.81
+
+# Simulation
+SIM_FPS        = 120
+SIM_SECONDS    = 10
+CSV_PATH       = "/Users/hamleejeong/Desktop/grec_sim.csv"
+
+# -------- Scene Setup --------
+SCN = bpy.context.scene
+SCN.render.fps = SIM_FPS
+SCN.render.fps_base = 1.0
+SCN.frame_start = 1
+SCN.frame_end   = int(SIM_SECONDS * SIM_FPS)
+
+def clear_collection(name):
+    col = bpy.data.collections.get(name)
+    if col is None:
+        col = bpy.data.collections.new(name)
+        SCN.collection.children.link(col)
+        return col
+    objs = list(col.objects)
+    for o in objs:
+        me = o.data if getattr(o, "data", None) else None
+        try: col.objects.unlink(o)
+        except RuntimeError: pass
+        if o.name in bpy.data.objects:
+            bpy.data.objects.remove(o, do_unlink=True)
+        if me and hasattr(me, "users") and me.users == 0:
+            if me.name in bpy.data.meshes:
+                bpy.data.meshes.remove(me, do_unlink=True)
+    return col
+
+COL = clear_collection("GREC_SIM")
+
+def obj_from_bmesh(name, bm, loc=(0,0,0), parent=None):
+    me = bpy.data.meshes.new(name+"_Mesh")
+    bm.to_mesh(me); bm.free()
+    ob = bpy.data.objects.new(name, me)
+    ob.location = loc
+    if parent: ob.parent = parent
+    COL.objects.link(ob)
+    return ob
+
+def make_plane(name, size, z=0.0, parent=None):
+    bm = bmesh.new()
+    bmesh.ops.create_grid(bm, x_segments=1, y_segments=1, size=size*0.5)
+    return obj_from_bmesh(name, bm, (0,0,z), parent)
+
+def make_box(name, size_xyz, loc=(0,0,0), parent=None):
+    sx, sy, sz = size_xyz
+    bm = bmesh.new()
+    bmesh.ops.create_cube(bm, size=2.0)
+    for v in bm.verts:
+        v.co.x *= sx/2; v.co.y *= sy/2; v.co.z *= sz/2
+    return obj_from_bmesh(name, bm, loc, parent)
+
+def make_cylinder(name, radius, depth, loc=(0,0,0), rot_euler=(0,0,0), parent=None, segs=48):
+    bm = bmesh.new()
+    # Blender 4.x: use radius1/radius2 (diameter*0.5 internally)
+    bmesh.ops.create_cone(
+        bm,
+        segments=segs,
+        radius1=radius,
+        radius2=radius,
+        depth=depth,
+        cap_ends=True
+    )
+    ob = obj_from_bmesh(name, bm, loc, parent)
+    ob.rotation_euler = rot_euler
+    return ob
+
+# -------- Build visible assembly --------
+asm = bpy.data.objects.new("GREC_Assembly", None)
+asm.empty_display_type = 'PLAIN_AXES'
+asm.empty_display_size = 0.7
+COL.objects.link(asm)
+
+floor = make_plane("GREC_Floor", 100.0, z=FLOOR_Z, parent=asm)
+
+rail_L = make_box("GREC_Rail_L",
+                  (RAIL_THICK, RAIL_THICK, RAIL_TOP_Z),
+                  loc=(+RAIL_OFFSET_X, 0, FLOOR_Z + RAIL_TOP_Z/2),
+                  parent=asm)
+rail_R = make_box("GREC_Rail_R",
+                  (RAIL_THICK, RAIL_THICK, RAIL_TOP_Z),
+                  loc=(-RAIL_OFFSET_X, 0, FLOOR_Z + RAIL_TOP_Z/2),
+                  parent=asm)
+
+wheel = make_cylinder("GREC_Wheel",
+                      radius=WHEEL_R, depth=WHEEL_W,
+                      loc=(0, 0, WHEEL_Z),
+                      rot_euler=(math.radians(90), 0.0, 0.0),
+                      parent=asm)
+
+rope = make_cylinder("GREC_Rope",
+                     radius=0.01, depth=1.0,
+                     loc=(0,0,(WHEEL_Z+START_HEIGHT_M)/2),
+                     rot_euler=(0.0, 0.0, 0.0), parent=asm)
+
+load = make_box("GREC_Load", LOAD_SIZE_M, loc=(0,0,START_HEIGHT_M), parent=asm)
+
+# -------- Numeric physics (no bpy.ops) --------
+dt = 1.0 / SIM_FPS
+frames = SCN.frame_end - SCN.frame_start + 1
+
+m = MASS_KG
+z = START_HEIGHT_M
+vz = 0.0
+wheel_angle = 0.0
+eta = ETA_TOTAL
+eps = 1e-9
+half_h = LOAD_SIZE_M[2]/2
+
+rows = [("frame","time_s","z_m","vz_mps","F_brake_N","P_recov_W","E_cum_J","wheel_deg")]
+E_cum = 0.0
+reached_floor = False
+
+for i in range(frames):
+    f = SCN.frame_start + i
+    t = i * dt
+
+    F_brake = 0.0
+    P_recov = 0.0
+
+    if not reached_floor:
+        if vz < 0.0:
+            F_visc = C_DAMP * (-vz)
+            P_visc = eta * F_visc * (-vz)
+            if P_visc > P_MAX_W:
+                F_brake = P_MAX_W / (eta * (-vz) + eps)
+                P_recov = P_MAX_W
+            else:
+                F_brake = F_visc
+                P_recov = P_visc
+
+        az = -G + (F_brake / m)
+        vz = vz + az * dt
+        z  = z  + vz * dt
+
+        min_z = FLOOR_Z + half_h
+        if z <= min_z:
+            z = min_z
+            vz = 0.0
+            reached_floor = True
+
+        if vz < 0.0 and WHEEL_R > eps:
+            wheel_angle += (-vz) * dt / WHEEL_R
+
+        E_cum += P_recov * dt
+
+    # keyframes
+    load.location.z = z
+    load.keyframe_insert(data_path="location", index=2, frame=f)
+
+    wheel.rotation_euler[1] = wheel_angle
+    wheel.keyframe_insert(data_path="rotation_euler", index=1, frame=f)
+
+    length = abs(z - WHEEL_Z)
+    rope.location.z = (z + WHEEL_Z) * 0.5
+    rope.scale = (1.0, 1.0, max(length, 0.001))
+    rope.keyframe_insert(data_path="location", index=2, frame=f)
+    rope.keyframe_insert(data_path="scale", frame=f)
+
+    rows.append((
+        f, round(t,6), round(z,6), round(vz,6),
+        round(F_brake,2), round(P_recov,2), round(E_cum,2),
+        round(math.degrees(wheel_angle),2)
+    ))
+
+# -------- CSV save --------
+try:
+    with open(CSV_PATH, "w", encoding="utf-8") as fp:
+        fp.write(",".join(map(str, rows[0])) + "\n")
+        for r in rows[1:]:
+            fp.write(",".join(map(str, r)) + "\n")
+    print(f"[GREC] CSV saved: {CSV_PATH}")
+except Exception as e:
+    print(f"[GREC] CSV save failed: {e}")
+
+# -------- Summary --------
+E_potential = m * G * max(0.0, START_HEIGHT_M - (FLOOR_Z + half_h))
+print("=== GREC Numeric Simulation Summary ===")
+print(f"Mass m               : {m:.2f} kg")
+print(f"Drop (approx)        : {max(0.0, START_HEIGHT_M - (FLOOR_Z + half_h)):.2f} m")
+print(f"C_damp / P_max       : {C_DAMP:.1f} N·s/m / {P_MAX_W:.1f} W")
+print(f"Efficiency (total)   : {eta:.3f}")
+print(f"m g Δh (upper bound) : {E_potential:.2f} J")
+print(f"Recovered (∫P dt)    : {E_cum:.2f} J")
+print("Animation keyframes written on load/wheel/rope.")
